@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Secure Chat Client - v4.7 (Полная версия с медиа и автосохранением)
+Secure Chat Client - v5.1 (с выбором цвета фона)
 """
 
 import sys
@@ -13,6 +13,8 @@ import base64
 import uuid
 import subprocess
 import platform
+import asyncio
+import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
@@ -32,6 +34,16 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.backends import default_backend
 from cryptography import x509
 from cryptography.x509.oid import NameOID
+
+# WebRTC импорты
+try:
+    from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
+    from aiortc.contrib.media import MediaPlayer, MediaRecorder
+
+    AIORTC_AVAILABLE = True
+except ImportError:
+    AIORTC_AVAILABLE = False
+    print("⚠️ aiortc не установлен. Звонки недоступны. Установите: pip install aiortc aioice av")
 
 
 # ==================== ГЕНЕРАЦИЯ SSL СЕРТИФИКАТОВ ====================
@@ -167,6 +179,12 @@ class NetworkClient(QThread):
     group_created = Signal(str, str, list, dict)
     search_results = Signal(list)
 
+    # Сигналы для звонков
+    call_incoming = Signal(str, str)  # caller, sdp
+    call_accepted = Signal(str, str)  # caller, sdp
+    call_ice_candidate = Signal(str, str)  # sender, candidate
+    call_ended = Signal(str)  # from
+
     def __init__(self):
         super().__init__()
         self.sock = None
@@ -174,6 +192,7 @@ class NetworkClient(QThread):
         self.host = self.port = self.name = self.email = self.password = None
         self.pubkey_bytes = None
         self.mode = "auth"
+        self.loop = None
 
         self.context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         self.context.check_hostname = False
@@ -271,6 +290,15 @@ class NetworkClient(QThread):
                 self.group_created.emit(msg["group_id"], msg["group_name"], msg["members"], msg.get("keys", {}))
             elif mtype == "search_results":
                 self.search_results.emit(msg.get("results", []))
+            # Обработка звонков
+            elif mtype == "call_incoming":
+                self.call_incoming.emit(msg["from"], msg.get("sdp", ""))
+            elif mtype == "call_accepted":
+                self.call_accepted.emit(msg["from"], msg.get("sdp", ""))
+            elif mtype == "call_ice":
+                self.call_ice_candidate.emit(msg["from"], msg.get("candidate", ""))
+            elif mtype == "call_ended":
+                self.call_ended.emit(msg.get("from", ""))
             elif mtype == "error":
                 self.error_occurred.emit(msg.get("text", "Ошибка сервера"))
         except Exception as e:
@@ -291,6 +319,44 @@ class NetworkClient(QThread):
     def send_private(self, target: str, encrypted_data: dict):
         if self.running and self.sock:
             self._send_json({"type": "private", "target": target, "data": encrypted_data})
+
+    # Методы для звонков
+    async def start_call(self):
+        self.pc = RTCPeerConnection()
+        self.is_calling = True
+
+        @self.pc.on("icecandidate")
+        def on_ice_candidate(candidate):
+            if candidate:
+                self.ice_candidates.append({
+                    "candidate": candidate.candidate,
+                    "sdpMLineIndex": str(candidate.sdpMLineIndex),  # Конвертируем в строку
+                    "sdpMid": candidate.sdpMid
+                })
+
+        # Убрали MediaPlayer - он вызывает ошибку
+        self.pc.addTrack(None)  # Просто добавляем пустой трек
+
+        offer = await self.pc.createOffer()
+        await self.pc.setLocalDescription(offer)
+
+        sdp = self.pc.localDescription.sdp
+        if self.crypto_key:
+            encrypted = Crypto.encrypt(self.crypto_key, sdp)
+            return json.dumps(encrypted)
+        return sdp._send_json({"type": "call_start", "target": target, "sdp": sdp})
+
+    def accept_call(self, caller: str, sdp: str):
+        if self.running and self.sock:
+            self._send_json({"type": "call_accept", "caller": caller, "sdp": sdp})
+
+    def send_ice_candidate(self, target: str, candidate: str):
+        if self.running and self.sock:
+            self._send_json({"type": "call_ice", "target": target, "candidate": candidate})
+
+    def end_call(self, target: str = None):
+        if self.running and self.sock:
+            self._send_json({"type": "call_end"})
 
     def _send_json(self, data: dict):
         try:
@@ -424,7 +490,8 @@ class LoginDialog(QDialog):
 
 class ChatWidget(QWidget):
     send_signal = Signal(str, str)
-    send_media_signal = Signal(str, str, str)  # chat_id, file_path, media_type
+    send_media_signal = Signal(str, str, str)
+    call_signal = Signal()  # Сигнал для звонка
 
     def __init__(self, chat: Chat, theme: str = "dark", parent=None):
         super().__init__(parent)
@@ -461,6 +528,15 @@ class ChatWidget(QWidget):
         self.send_button.clicked.connect(self.on_send)
         self.send_button.setObjectName("sendButton")
 
+        # Кнопка звонка (только для приватных чатов)
+        self.call_button = QPushButton("📞")
+        self.call_button.setFixedSize(40, 40)
+        self.call_button.clicked.connect(self.on_call_clicked)
+        self.call_button.setObjectName("callButton")
+        if self.chat.type != "private":
+            self.call_button.setEnabled(False)
+            self.call_button.setToolTip("Звонки доступны только в приватных чатах")
+
         self.media_button = QPushButton("📎")
         self.media_button.setFixedSize(40, 40)
         self.media_button.clicked.connect(self.on_send_media)
@@ -468,6 +544,7 @@ class ChatWidget(QWidget):
 
         input_layout.addWidget(self.input_field)
         input_layout.addWidget(self.send_button)
+        input_layout.addWidget(self.call_button)
         input_layout.addWidget(self.media_button)
         layout.addLayout(input_layout)
 
@@ -487,6 +564,10 @@ class ChatWidget(QWidget):
                     subprocess.Popen(["xdg-open", file_path])
             except Exception as e:
                 print(f"Ошибка открытия файла: {e}")
+
+    def on_call_clicked(self):
+        """Клик по кнопке звонка"""
+        self.call_signal.emit()
 
     def on_send_media(self):
         """Отправка медиа-файла"""
@@ -512,20 +593,26 @@ class ChatWidget(QWidget):
                 QLabel#chatHeader {font-weight: bold; padding: 12px; background-color: #2D2D3A; color: #F3F4F6;}
                 QTextBrowser#messagesArea {background-color: #1E1E2E; border: none; padding: 8px; color: #F3F4F6;}
                 QLineEdit#inputField {background-color: #3A3A4A; border: none; border-radius: 20px; padding: 10px 16px; color: #F3F4F6;}
-                QPushButton#sendButton {background-color: #7C3AED; border: none; border-radius: 20px; padding: 10px 20px; color: white; font-weight: bold;}
-                QPushButton#mediaButton {background-color: #22C55E; border: none; border-radius: 20px; padding: 10px; color: white; font-weight: bold; font-size: 16px;}
+                QPushButton#sendButton, QPushButton#callButton, QPushButton#mediaButton {background-color: #7C3AED; border: none; border-radius: 20px; color: white; font-weight: bold;}
+                QPushButton#sendButton {padding: 10px 20px;}
+                QPushButton#callButton, QPushButton#mediaButton {padding: 10px; font-size: 16px;}
                 QPushButton#sendButton:hover {background-color: #9F67FF;}
+                QPushButton#callButton:hover {background-color: #9F67FF;}
                 QPushButton#mediaButton:hover {background-color: #16A34A;}
+                QPushButton#mediaButton {background-color: #22C55E;}
             """)
         else:
             self.setStyleSheet("""
                 QLabel#chatHeader {font-weight: bold; padding: 12px; background-color: #FFFFFF; color: #1F2937; border-bottom: 1px solid #E5E7EB;}
                 QTextBrowser#messagesArea {background-color: #F8F9FA; border: none; padding: 8px; color: #1F2937;}
                 QLineEdit#inputField {background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 20px; padding: 10px 16px; color: #1F2937;}
-                QPushButton#sendButton {background-color: #7C3AED; border: none; border-radius: 20px; padding: 10px 20px; color: white; font-weight: bold;}
-                QPushButton#mediaButton {background-color: #22C55E; border: none; border-radius: 20px; padding: 10px; color: white; font-weight: bold; font-size: 16px;}
+                QPushButton#sendButton, QPushButton#callButton, QPushButton#mediaButton {background-color: #7C3AED; border: none; border-radius: 20px; color: white; font-weight: bold;}
+                QPushButton#sendButton {padding: 10px 20px;}
+                QPushButton#callButton, QPushButton#mediaButton {padding: 10px; font-size: 16px;}
                 QPushButton#sendButton:hover {background-color: #9F67FF;}
+                QPushButton#callButton:hover {background-color: #9F67FF;}
                 QPushButton#mediaButton:hover {background-color: #16A34A;}
+                QPushButton#mediaButton {background-color: #22C55E;}
             """)
 
     def update_theme(self, theme: str):
@@ -562,11 +649,13 @@ class ChatWidget(QWidget):
 
         # Проверяем, является ли сообщение ссылкой на файл
         if msg.text.startswith("📎"):
-            # Извлекаем путь к файлу
             file_path = msg.text.split(": ")[1] if ": " in msg.text else msg.text[2:]
-            # Создаем HTML ссылку
-            file_url = QUrl.fromLocalFile(file_path).toString()
-            formatted_text = f'<a href="{file_url}">{msg.text}</a>'
+            # Проверяем, существует ли файл
+            if os.path.exists(file_path):
+                file_url = QUrl.fromLocalFile(file_path).toString()
+                formatted_text = f'<a href="{file_url}">{msg.text}</a>'
+            else:
+                formatted_text = SimpleFormatter.format_message(msg.text)
         else:
             formatted_text = SimpleFormatter.format_message(msg.text)
 
@@ -580,7 +669,6 @@ class ChatWidget(QWidget):
         </div>
         '''
         self.messages_area.insertHtml(html)
-        self.messages_area.moveCursor(QTextCursor.End)
 
     def add_message(self, sender: str, text: str, is_own: bool = False):
         self.chat.add_message(sender, text, is_own)
@@ -594,6 +682,20 @@ class ChatWidget(QWidget):
 
 
 class MainWindow(QMainWindow):
+    # Палитра цветов для фона
+    BACKGROUNDS = {
+        "Чёрный": "#000000",
+        "Белый": "#FFFFFF",
+        "Серый": "#808080",
+        "Тёмно-серый": "#2D2D3A",
+        "Светло-серый": "#F3F4F6",
+        "Синий": "#1E3A8A",
+        "Зелёный": "#065F46",
+        "Фиолетовый": "#5B21B6",
+        "Красный": "#7F1D1D",
+        "Оранжевый": "#92400E"
+    }
+
     def __init__(self, network: NetworkClient, username: str, private_key):
         super().__init__()
         self.network = network
@@ -605,6 +707,16 @@ class MainWindow(QMainWindow):
         self.current_chat_id = None
         self.current_theme = "dark"
         self.pending_messages: Dict[str, list] = {}
+
+        # Настройки фона
+        self.current_bg = "Чёрный"
+        self.load_background_setting()
+
+        # Для звонков
+        self.call_manager = None
+        self.current_caller = None
+        self.call_in_progress = False
+        self.call_thread = None
 
         # Таймер автосохранения (каждые 5 минут)
         self.auto_save_timer = QTimer()
@@ -627,6 +739,78 @@ class MainWindow(QMainWindow):
         self.update_chat_list()
         self.add_system_message("Добро пожаловать в защищенный чат!")
 
+        if not AIORTC_AVAILABLE:
+            self.add_system_message(
+                "⚠️ WebRTC не установлен. Звонки недоступны. Установите: pip install aiortc aioice av")
+
+    # ==================== НАСТРОЙКИ ФОНА ====================
+    def load_background_setting(self):
+        """Загрузка настроек фона"""
+        try:
+            if os.path.exists("settings.json"):
+                with open("settings.json", "r", encoding="utf-8") as f:
+                    settings = json.load(f)
+                    self.current_bg = settings.get("background", "Чёрный")
+        except Exception as e:
+            print(f"Ошибка загрузки настроек фона: {e}")
+            self.current_bg = "Чёрный"
+
+    def save_background_setting(self):
+        """Сохранение настроек фона"""
+        try:
+            with open("settings.json", "w", encoding="utf-8") as f:
+                json.dump({"background": self.current_bg}, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Ошибка сохранения настроек фона: {e}")
+
+    def choose_background(self):
+        """Выбор цвета фона из палитры"""
+        items = list(self.BACKGROUNDS.keys())
+        item, ok = QInputDialog.getItem(
+            self, "Выбор фона",
+            "Выберите цвет фона:",
+            items, items.index(self.current_bg), False
+        )
+        if ok:
+            self.current_bg = item
+            self.save_background_setting()
+            self.apply_background()
+            self.add_system_message(f"✅ Фон изменён на {item}")
+
+    def apply_background(self):
+        """Применение фонового цвета"""
+        color = self.BACKGROUNDS.get(self.current_bg, "#000000")
+
+        # Применяем фон через стили
+        self.setStyleSheet(f"""
+            QMainWindow, QWidget#centralWidget {{ background-color: {color}; }}
+            QWidget#leftPanel {{ background-color: {color}; border-right: 1px solid #3A3A4A; }}
+            QWidget#rightPanel {{ background-color: {color}; }}
+            QLabel#nameLabel {{ color: {"#F3F4F6" if self.current_bg not in ["Белый", "Светло-серый"] else "#1F2937"}; font-weight: bold; font-size: 14px; padding: 8px; }}
+            QLabel#chatsLabel, QLabel#usersLabel {{ color: {"#9CA3AF" if self.current_bg not in ["Белый", "Светло-серый"] else "#6B7280"}; font-weight: bold; padding: 8px 4px; }}
+            QLabel#emptyChatLabel {{ color: {"#6B7280" if self.current_bg not in ["Белый", "Светло-серый"] else "#9CA3AF"}; font-size: 16px; }}
+            QLineEdit#searchInput {{ background-color: {"#3A3A4A" if self.current_bg not in ["Белый", "Светло-серый"] else "#FFFFFF"}; border: {"none" if self.current_bg not in ["Белый", "Светло-серый"] else "1px solid #E5E7EB"}; border-radius: 20px; padding: 8px 12px; color: {"#F3F4F6" if self.current_bg not in ["Белый", "Светло-серый"] else "#1F2937"}; margin-bottom: 8px; }}
+            QPushButton#btnSaved {{ background-color: #22C55E; color: white; font-weight: bold; padding: 8px; border-radius: 20px; border: none; }}
+            QPushButton#btnSaved:hover {{ background-color: #16A34A; }}
+            QPushButton#btnBg, QPushButton#btnTheme {{ background-color: {"#3A3A4A" if self.current_bg not in ["Белый", "Светло-серый"] else "#E5E7EB"}; color: {"#F3F4F6" if self.current_bg not in ["Белый", "Светло-серый"] else "#374151"}; border-radius: 20px; font-size: 16px; }}
+            QPushButton#btnBg:hover, QPushButton#btnTheme:hover {{ background-color: {"#4A4A5A" if self.current_bg not in ["Белый", "Светло-серый"] else "#D1D5DB"}; }}
+            QPushButton#btnCreateGroup {{ background-color: #7C3AED; border: none; border-radius: 20px; padding: 8px; color: white; margin-top: 8px; }}
+            QPushButton#btnCreateGroup:hover {{ background-color: #9F67FF; }}
+            QListWidget#chatList, QListWidget#userList {{ background-color: {"#2D2D3A" if self.current_bg not in ["Белый", "Светло-серый"] else "#FFFFFF"}; color: {"#F3F4F6" if self.current_bg not in ["Белый", "Светло-серый"] else "#1F2937"}; border: {"none" if self.current_bg not in ["Белый", "Светло-серый"] else "1px solid #E5E7EB"}; border-radius: 8px; padding: 4px; }}
+            QListWidget#chatList::item, QListWidget#userList::item {{ padding: 8px; border-radius: 6px; }}
+            QListWidget#chatList::item:hover, QListWidget#userList::item:hover {{ background-color: {"#3A3A4A" if self.current_bg not in ["Белый", "Светло-серый"] else "#F3F4F6"}; }}
+            QListWidget#chatList::item:selected, QListWidget#userList::item:selected {{ background-color: #7C3AED; color: white; }}
+            QWidget#chatStack {{ background-color: {color}; }}
+            QStatusBar {{ background-color: {"#2D2D3A" if self.current_bg not in ["Белый", "Светло-серый"] else "#FFFFFF"}; color: {"#9CA3AF" if self.current_bg not in ["Белый", "Светло-серый"] else "#6B7280"}; }}
+        """)
+
+        # Обновляем цвета в чатах
+        for i in range(self.chat_stack_layout.count()):
+            widget = self.chat_stack_layout.itemAt(i).widget()
+            if isinstance(widget, ChatWidget):
+                widget.update_theme(self.current_theme)
+
+    # ==================== АВТОСОХРАНЕНИЕ И АВТОУДАЛЕНИЕ ====================
     def show_delete_interval_dialog(self):
         items = ["Каждые 3 часа", "Каждый день", "Каждую неделю", "Отключить"]
         intervals = [10800, 86400, 604800, 0]
@@ -711,10 +895,175 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 print(f"Ошибка загрузки {filename}: {e}")
 
-    # Только метод send_media в MainWindow:
+    # ==================== ЗВОНКИ ====================
+    def start_call_to_user(self):
+        """Начать звонок выбранному пользователю"""
+        if not AIORTC_AVAILABLE:
+            self.add_system_message("❌ WebRTC не установлен. Установите: pip install aiortc aioice av")
+            return
 
+        if not self.current_chat_id or self.current_chat_id == "saved_messages":
+            self.add_system_message("❌ Выберите пользователя")
+            return
+
+        chat = self.chats[self.current_chat_id]
+        if chat.type != "private":
+            self.add_system_message("❌ Звонки только в приватных чатах")
+            return
+
+        if not chat.shared_key:
+            self.add_system_message("❌ Нет ключа шифрования")
+            return
+
+        if self.call_in_progress:
+            self.add_system_message("❌ Звонок уже в процессе")
+            return
+
+        self.call_manager = CallManager(crypto_key=chat.shared_key)
+        self.call_in_progress = True
+        self.add_system_message(f"📞 Начинаем звонок {chat.name}...")
+
+        # Запускаем асинхронный звонок
+        self.call_thread = threading.Thread(target=self._run_async_call, args=(chat.name,), daemon=True)
+        self.call_thread.start()
+
+    def _run_async_call(self, target: str):
+        """Запуск асинхронного звонка в отдельном потоке"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            loop.run_until_complete(self._async_start_call(target))
+        except Exception as e:
+            self.add_system_message(f"❌ Ошибка звонка: {e}")
+            self.call_in_progress = False
+        finally:
+            loop.close()
+
+    async def _async_start_call(self, target: str):
+        """Асинхронный старт звонка"""
+        try:
+            sdp = await self.call_manager.start_call()
+            self.network.start_call(target, sdp)
+
+            # Отправляем ICE кандидаты
+            while self.call_in_progress:
+                candidates = self.call_manager.get_ice_candidates()
+                for candidate in candidates:
+                    encrypted_candidate = Crypto.encrypt(self.call_manager.crypto_key, json.dumps(candidate))
+                    self.network.send_ice_candidate(target, json.dumps(encrypted_candidate))
+                await asyncio.sleep(0.5)
+        except Exception as e:
+            self.add_system_message(f"❌ Ошибка: {e}")
+
+    def on_call_incoming(self, caller: str, sdp: str):
+        """Входящий звонок"""
+        self.current_caller = caller
+        reply = QMessageBox.question(
+            self, "Входящий звонок",
+            f"{caller} звонит вам. Ответить?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            chat_id = f"private_{caller}"
+            if chat_id in self.chats and self.chats[chat_id].shared_key:
+                self.call_manager = CallManager(crypto_key=self.chats[chat_id].shared_key)
+                self.call_in_progress = True
+
+                # Запускаем принятие звонка
+                self.call_thread = threading.Thread(target=self._run_async_accept, args=(caller, sdp), daemon=True)
+                self.call_thread.start()
+            else:
+                self.add_system_message("❌ Нет ключа шифрования")
+        else:
+            self.network.end_call(caller)
+
+    def _run_async_accept(self, caller: str, sdp: str):
+        """Запуск асинхронного принятия звонка"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            loop.run_until_complete(self._async_accept_call(caller, sdp))
+        except Exception as e:
+            self.add_system_message(f"❌ Ошибка: {e}")
+            self.call_in_progress = False
+        finally:
+            loop.close()
+
+    async def _async_accept_call(self, caller: str, sdp: str):
+        """Асинхронное принятие звонка"""
+        try:
+            sdp_response = await self.call_manager.start_call()
+            await self.call_manager.handle_answer(sdp)
+            self.network.accept_call(caller, sdp_response)
+            self.add_system_message(f"✅ Звонок принят от {caller}")
+        except Exception as e:
+            self.add_system_message(f"❌ Ошибка: {e}")
+
+    def on_call_accepted(self, caller: str, sdp: str):
+        """Звонок принят собеседником"""
+        self.add_system_message(f"✅ {caller} принял звонок")
+        if self.call_manager:
+            self.call_thread = threading.Thread(target=self._run_async_handle_answer, args=(sdp,), daemon=True)
+            self.call_thread.start()
+
+    def _run_async_handle_answer(self, sdp: str):
+        """Асинхронная обработка ответа"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            loop.run_until_complete(self.call_manager.handle_answer(sdp))
+        except Exception as e:
+            print(f"Ошибка обработки ответа: {e}")
+        finally:
+            loop.close()
+
+    def on_ice_candidate(self, sender: str, candidate: str):
+        """Получен ICE кандидат"""
+        if self.call_manager and self.call_in_progress:
+            self.call_thread = threading.Thread(target=self._run_async_add_ice, args=(candidate,), daemon=True)
+            self.call_thread.start()
+
+    def _run_async_add_ice(self, candidate: str):
+        """Асинхронное добавление ICE кандидата"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            loop.run_until_complete(self.call_manager.add_ice_candidate(candidate))
+        except Exception as e:
+            print(f"Ошибка добавления ICE: {e}")
+        finally:
+            loop.close()
+
+    def on_call_ended(self, sender: str):
+        """Звонок завершён"""
+        self.add_system_message(f"📞 Звонок завершён{f' с {sender}' if sender else ''}")
+        self.call_in_progress = False
+        self.current_caller = None
+        if self.call_manager:
+            self.call_thread = threading.Thread(target=self._run_async_end_call, daemon=True)
+            self.call_thread.start()
+
+    def _run_async_end_call(self):
+        """Асинхронное завершение звонка"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            loop.run_until_complete(self.call_manager.end_call())
+        except Exception as e:
+            print(f"Ошибка завершения: {e}")
+        finally:
+            loop.close()
+            self.call_manager = None
+
+    # ==================== ОТПРАВКА МЕДИА И СООБЩЕНИЙ ====================
     def send_media(self, chat_id: str, file_path: str, media_type: str):
-        """Отправка зашифрованного медиа"""
+        """Отправка зашифрованного медиа (с поддержкой избранного)"""
         if chat_id not in self.chats:
             return
 
@@ -726,34 +1075,188 @@ class MainWindow(QMainWindow):
 
             file_b64 = base64.b64encode(file_data).decode()
             file_name = os.path.basename(file_path)
-            local_file = f"media_{uuid.uuid4()}_{file_name}"
+            ext = file_path.split('.')[-1].lower()
+            local_file = f"media_{uuid.uuid4()}.{ext}"
 
-            # Сохраняем копию локально
             with open(local_file, 'wb') as f:
                 f.write(file_data)
 
             if chat.type == "private":
-                if not chat.shared_key:
-                    self.add_system_message(f"❌ Нет ключа для {chat.name}")
-                    return
+                if chat_id == "saved_messages":
+                    chat.add_message(self.username, f"📎 {media_type.upper()}: {local_file}", True)
+                    self.save_saved_messages()
+                else:
+                    if not chat.shared_key:
+                        self.add_system_message(f"❌ Нет ключа для {chat.name}")
+                        return
 
-                encrypted = Crypto.encrypt(chat.shared_key, file_b64)
+                    encrypted = Crypto.encrypt(chat.shared_key, file_b64)
+                    self.network._send_json({
+                        "type": "private",
+                        "target": chat.name,
+                        "data": encrypted,
+                        "media_type": media_type
+                    })
+
+                    chat.add_message(self.username, f"📎 {media_type.upper()}: {local_file}", True)
+                    self.save_chat_to_file(chat_id, chat)
+
+                if self.current_chat_id == chat_id:
+                    self.switch_chat(chat_id)
+
+            elif chat.type == "group":
+                my_key_b64 = chat.group_keys.get(self.username)
+                if not my_key_b64:
+                    self.add_system_message("❌ Нет ключа для группы")
+                    return
+                key = base64.b64decode(my_key_b64)
+                encrypted = Crypto.encrypt(key, file_b64)
                 self.network._send_json({
-                    "type": "private",
-                    "target": chat.name,
+                    "type": "group_message",
+                    "group_id": chat.id,
                     "data": encrypted,
                     "media_type": media_type
                 })
-
                 chat.add_message(self.username, f"📎 {media_type.upper()}: {local_file}", True)
-                self.save_chat_to_file(chat_id, chat)
-
                 if self.current_chat_id == chat_id:
                     self.switch_chat(chat_id)
 
         except Exception as e:
             self.add_system_message(f"❌ Ошибка отправки файла: {e}")
 
+    def send_message(self, chat_id: str, text: str):
+        """Отправка текстового сообщения (с поддержкой избранного)"""
+        if chat_id not in self.chats:
+            return
+        chat = self.chats[chat_id]
+
+        if chat.type == "private":
+            if chat_id == "saved_messages":
+                chat.add_message(self.username, text, True)
+                self.save_saved_messages()
+            else:
+                target = chat.name
+                if chat.shared_key:
+                    encrypted = Crypto.encrypt(chat.shared_key, text)
+                    self.network.send_private(target, encrypted)
+                    chat.add_message(self.username, text, True)
+                    self.save_chat_to_file(chat_id, chat)
+
+            if self.current_chat_id == chat_id:
+                self.switch_chat(chat_id)
+
+        elif chat.type == "group":
+            my_key_b64 = chat.group_keys.get(self.username)
+            if my_key_b64:
+                key = base64.b64decode(my_key_b64)
+                encrypted = Crypto.encrypt(key, text)
+                self.network._send_json({
+                    "type": "group_message",
+                    "group_id": chat.id,
+                    "data": encrypted
+                })
+                chat.add_message(self.username, text, True)
+                if self.current_chat_id == chat_id:
+                    self.switch_chat(chat_id)
+
+    def on_message_received(self, chat_type: str, sender: str, data: dict):
+        if sender == self.username:
+            return
+
+        chat_id = f"private_{sender}"
+
+        if chat_id not in self.chats or not self.chats[chat_id].shared_key:
+            if chat_id not in self.pending_messages:
+                self.pending_messages[chat_id] = []
+            self.pending_messages[chat_id].append((sender, data))
+            if self.network and self.network.running:
+                self.network._send_json({"type": "get_users"})
+            return
+
+        chat = self.chats[chat_id]
+        try:
+            # Проверяем, зашифровано ли сообщение
+            if isinstance(data, dict) and "nonce" in data and "ciphertext" in data:
+                plaintext = Crypto.decrypt(chat.shared_key, data["nonce"], data["ciphertext"])
+            else:
+                plaintext = str(data)
+
+            media_type = data.get("media_type", "text") if isinstance(data, dict) else "text"
+
+            if media_type != "text":
+                try:
+                    file_data = base64.b64decode(plaintext)
+                    if media_type == "image":
+                        ext = "jpg"
+                    elif media_type == "video":
+                        ext = "mp4"
+                    elif media_type == "audio":
+                        ext = "mp3"
+                    else:
+                        ext = "bin"
+                    local_file = f"media_{uuid.uuid4()}.{ext}"
+                    with open(local_file, 'wb') as f:
+                        f.write(file_data)
+                    chat.add_message(sender, f"📎 {media_type.upper()}: {local_file}", False)
+                except Exception as e:
+                    print(f"Ошибка декодирования медиа: {e}")
+                    chat.add_message(sender, plaintext, False)
+            else:
+                chat.add_message(sender, plaintext, False)
+
+            if chat_id != "saved_messages":
+                self.save_chat_to_file(chat_id, chat)
+
+            if self.current_chat_id == chat_id:
+                self.switch_chat(chat_id)
+            else:
+                self.update_chat_list()
+        except Exception as e:
+            print(f"⚠️ Ошибка расшифровки: {e}")
+            self.add_system_message(f"⚠️ Ошибка расшифровки: {e}")
+
+    def _process_pending_messages(self):
+        for chat_id, msgs in list(self.pending_messages.items()):
+            if chat_id in self.chats and self.chats[chat_id].shared_key:
+                chat = self.chats[chat_id]
+                for sender, data in msgs:
+                    try:
+                        if isinstance(data, dict) and "nonce" in data and "ciphertext" in data:
+                            plaintext = Crypto.decrypt(chat.shared_key, data["nonce"], data["ciphertext"])
+                        else:
+                            plaintext = str(data)
+
+                        media_type = data.get("media_type", "text") if isinstance(data, dict) else "text"
+
+                        if media_type != "text":
+                            try:
+                                file_data = base64.b64decode(plaintext)
+                                if media_type == "image":
+                                    ext = "jpg"
+                                elif media_type == "video":
+                                    ext = "mp4"
+                                elif media_type == "audio":
+                                    ext = "mp3"
+                                else:
+                                    ext = "bin"
+                                local_file = f"media_{uuid.uuid4()}.{ext}"
+                                with open(local_file, 'wb') as f:
+                                    f.write(file_data)
+                                chat.add_message(sender, f"📎 {media_type.upper()}: {local_file}", False)
+                            except:
+                                chat.add_message(sender, plaintext, False)
+                        else:
+                            chat.add_message(sender, plaintext, False)
+                    except Exception as e:
+                        print(f"Ошибка обработки: {e}")
+
+                if self.current_chat_id == chat_id:
+                    self.switch_chat(chat_id)
+                else:
+                    self.update_chat_list()
+                del self.pending_messages[chat_id]
+
+    # ==================== UI ====================
     def setup_ui(self):
         self.setWindowTitle("Secure Chat")
         self.resize(1100, 700)
@@ -785,6 +1288,13 @@ class MainWindow(QMainWindow):
         self.btn_saved.setObjectName("btnSaved")
         self.btn_saved.clicked.connect(self.open_saved_messages)
         left_layout.addWidget(self.btn_saved)
+
+        # Кнопка выбора фона
+        self.btn_bg = QPushButton("🎨")
+        self.btn_bg.setFixedSize(40, 40)
+        self.btn_bg.setObjectName("btnBg")
+        self.btn_bg.clicked.connect(self.choose_background)
+        left_layout.addWidget(self.btn_bg)
 
         self.btn_theme = QPushButton("🌙")
         self.btn_theme.setFixedSize(40, 40)
@@ -833,6 +1343,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter)
         self.statusBar().showMessage("Подключено")
 
+        self.apply_background()
         self.apply_theme()
 
     def on_search_text_changed(self, text: str):
@@ -848,56 +1359,43 @@ class MainWindow(QMainWindow):
 
     def apply_theme(self):
         if self.current_theme == "dark":
-            self.setStyleSheet("""
-                QMainWindow, QWidget#centralWidget { background-color: #1E1E2E; }
-                QWidget#leftPanel { background-color: #2D2D3A; border-right: 1px solid #3A3A4A; }
-                QWidget#rightPanel { background-color: #1E1E2E; }
-                QLabel#nameLabel { color: #F3F4F6; font-weight: bold; font-size: 14px; padding: 8px; }
-                QLabel#chatsLabel, QLabel#usersLabel { color: #9CA3AF; font-weight: bold; padding: 8px 4px; }
-                QLabel#emptyChatLabel { color: #6B7280; font-size: 16px; }
-                QLineEdit#searchInput { background-color: #3A3A4A; border: none; border-radius: 20px; padding: 8px 12px; color: #F3F4F6; margin-bottom: 8px; }
-                QPushButton#btnSaved { background-color: #22C55E; color: white; font-weight: bold; padding: 8px; border-radius: 20px; border: none; }
-                QPushButton#btnSaved:hover { background-color: #16A34A; }
-                QPushButton#btnTheme { background-color: #3A3A4A; color: #F3F4F6; border-radius: 20px; font-size: 16px; }
-                QPushButton#btnCreateGroup { background-color: #7C3AED; border: none; border-radius: 20px; padding: 8px; color: white; margin-top: 8px; }
-                QPushButton#btnCreateGroup:hover { background-color: #9F67FF; }
-                QListWidget#chatList, QListWidget#userList { background-color: #2D2D3A; color: #F3F4F6; border: none; border-radius: 8px; padding: 4px; }
-                QListWidget#chatList::item, QListWidget#userList::item { padding: 8px; border-radius: 6px; }
-                QListWidget#chatList::item:hover, QListWidget#userList::item:hover { background-color: #3A3A4A; }
-                QListWidget#chatList::item:selected, QListWidget#userList::item:selected { background-color: #7C3AED; color: white; }
-                QWidget#chatStack { background-color: #1E1E2E; }
-                QStatusBar { background-color: #2D2D3A; color: #9CA3AF; }
+            # Дополнительные стили для тёмной темы поверх фона
+            self.setStyleSheet(self.styleSheet() + """
+                QLabel#chatHeader {font-weight: bold; padding: 12px; background-color: #2D2D3A; color: #F3F4F6;}
+                QTextBrowser#messagesArea {background-color: #1E1E2E; border: none; padding: 8px; color: #F3F4F6;}
+                QLineEdit#inputField {background-color: #3A3A4A; border: none; border-radius: 20px; padding: 10px 16px; color: #F3F4F6;}
+                QPushButton#sendButton, QPushButton#callButton, QPushButton#mediaButton {background-color: #7C3AED; border: none; border-radius: 20px; color: white; font-weight: bold;}
+                QPushButton#sendButton {padding: 10px 20px;}
+                QPushButton#callButton, QPushButton#mediaButton {padding: 10px; font-size: 16px;}
+                QPushButton#sendButton:hover {background-color: #9F67FF;}
+                QPushButton#callButton:hover {background-color: #9F67FF;}
+                QPushButton#mediaButton:hover {background-color: #16A34A;}
+                QPushButton#mediaButton {background-color: #22C55E;}
             """)
         else:
-            self.setStyleSheet("""
-                QMainWindow, QWidget#centralWidget { background-color: #F8F9FA; }
-                QWidget#leftPanel { background-color: #FFFFFF; border-right: 1px solid #E5E7EB; }
-                QWidget#rightPanel { background-color: #F8F9FA; }
-                QLabel#nameLabel { color: #1F2937; font-weight: bold; font-size: 14px; padding: 8px; }
-                QLabel#chatsLabel, QLabel#usersLabel { color: #6B7280; font-weight: bold; padding: 8px 4px; }
-                QLabel#emptyChatLabel { color: #9CA3AF; font-size: 16px; }
-                QLineEdit#searchInput { background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 20px; padding: 8px 12px; color: #1F2937; margin-bottom: 8px; }
-                QPushButton#btnSaved { background-color: #22C55E; color: white; font-weight: bold; padding: 8px; border-radius: 20px; border: none; }
-                QPushButton#btnSaved:hover { background-color: #16A34A; }
-                QPushButton#btnTheme { background-color: #E5E7EB; color: #374151; border-radius: 20px; font-size: 16px; }
-                QPushButton#btnCreateGroup { background-color: #7C3AED; border: none; border-radius: 20px; padding: 8px; color: white; margin-top: 8px; }
-                QPushButton#btnCreateGroup:hover { background-color: #9F67FF; }
-                QListWidget#chatList, QListWidget#userList { background-color: #FFFFFF; color: #1F2937; border: 1px solid #E5E7EB; border-radius: 8px; padding: 4px; }
-                QListWidget#chatList::item, QListWidget#userList::item { padding: 8px; border-radius: 6px; }
-                QListWidget#chatList::item:hover, QListWidget#userList::item:hover { background-color: #F3F4F6; }
-                QListWidget#chatList::item:selected, QListWidget#userList::item:selected { background-color: #7C3AED; color: white; }
-                QWidget#chatStack { background-color: #F8F9FA; }
-                QStatusBar { background-color: #FFFFFF; color: #6B7280; border-top: 1px solid #E5E7EB; }
+            self.setStyleSheet(self.styleSheet() + """
+                QLabel#chatHeader {font-weight: bold; padding: 12px; background-color: #FFFFFF; color: #1F2937; border-bottom: 1px solid #E5E7EB;}
+                QTextBrowser#messagesArea {background-color: #F8F9FA; border: none; padding: 8px; color: #1F2937;}
+                QLineEdit#inputField {background-color: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 20px; padding: 10px 16px; color: #1F2937;}
+                QPushButton#sendButton, QPushButton#callButton, QPushButton#mediaButton {background-color: #7C3AED; border: none; border-radius: 20px; color: white; font-weight: bold;}
+                QPushButton#sendButton {padding: 10px 20px;}
+                QPushButton#callButton, QPushButton#mediaButton {padding: 10px; font-size: 16px;}
+                QPushButton#sendButton:hover {background-color: #9F67FF;}
+                QPushButton#callButton:hover {background-color: #9F67FF;}
+                QPushButton#mediaButton:hover {background-color: #16A34A;}
+                QPushButton#mediaButton {background-color: #22C55E;}
             """)
+
+        # Обновляем чаты
+        for i in range(self.chat_stack_layout.count()):
+            widget = self.chat_stack_layout.itemAt(i).widget()
+            if isinstance(widget, ChatWidget):
+                widget.update_theme(self.current_theme)
 
     def toggle_theme(self):
         self.current_theme = "light" if self.current_theme == "dark" else "dark"
         self.btn_theme.setText("☀️" if self.current_theme == "light" else "🌙")
         self.apply_theme()
-        for i in range(self.chat_stack_layout.count()):
-            widget = self.chat_stack_layout.itemAt(i).widget()
-            if isinstance(widget, ChatWidget):
-                widget.update_theme(self.current_theme)
 
     def connect_signals(self):
         self.network.user_list_updated.connect(self.on_user_list)
@@ -907,6 +1405,12 @@ class MainWindow(QMainWindow):
         self.network.group_created.connect(self.on_group_created)
         self.network.error_occurred.connect(self.on_error)
         self.network.search_results.connect(self.on_search_results)
+
+        # Сигналы звонков
+        self.network.call_incoming.connect(self.on_call_incoming)
+        self.network.call_accepted.connect(self.on_call_accepted)
+        self.network.call_ice_candidate.connect(self.on_ice_candidate)
+        self.network.call_ended.connect(self.on_call_ended)
 
     def on_user_list(self, users_data: List[dict]):
         print(f"[DEBUG] Получен users_list: {[u['name'] for u in users_data]}")
@@ -957,68 +1461,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"❌ Ошибка вычисления ключа для {peer_name}: {e}")
             return None
-
-    def on_message_received(self, chat_type: str, sender: str, data: dict):
-        if sender == self.username:
-            return
-
-        chat_id = f"private_{sender}"
-
-        if chat_id not in self.chats or not self.chats[chat_id].shared_key:
-            if chat_id not in self.pending_messages:
-                self.pending_messages[chat_id] = []
-            self.pending_messages[chat_id].append((sender, data))
-            if self.network and self.network.running:
-                self.network._send_json({"type": "get_users"})
-            return
-
-        chat = self.chats[chat_id]
-        try:
-            plaintext = Crypto.decrypt(chat.shared_key, data["nonce"], data["ciphertext"])
-            media_type = data.get("media_type", "text")
-
-            if media_type != "text":
-                file_data = base64.b64decode(plaintext)
-                local_file = f"media_{uuid.uuid4()}_{media_type}"
-                with open(local_file, 'wb') as f:
-                    f.write(file_data)
-                chat.add_message(sender, f"📎 {media_type.upper()}: {local_file}", False)
-            else:
-                chat.add_message(sender, plaintext, False)
-
-            if chat_id != "saved_messages":
-                self.save_chat_to_file(chat_id, chat)
-
-            if self.current_chat_id == chat_id:
-                self.switch_chat(chat_id)
-            else:
-                self.update_chat_list()
-        except Exception as e:
-            self.add_system_message(f"⚠️ Ошибка расшифровки: {e}")
-
-    def _process_pending_messages(self):
-        for chat_id, msgs in list(self.pending_messages.items()):
-            if chat_id in self.chats and self.chats[chat_id].shared_key:
-                chat = self.chats[chat_id]
-                for sender, data in msgs:
-                    try:
-                        plaintext = Crypto.decrypt(chat.shared_key, data["nonce"], data["ciphertext"])
-                        media_type = data.get("media_type", "text")
-                        if media_type != "text":
-                            file_data = base64.b64decode(plaintext)
-                            local_file = f"media_{uuid.uuid4()}_{media_type}"
-                            with open(local_file, 'wb') as f:
-                                f.write(file_data)
-                            chat.add_message(sender, f"📎 {media_type.upper()}: {local_file}", False)
-                        else:
-                            chat.add_message(sender, plaintext, False)
-                    except:
-                        pass
-                if self.current_chat_id == chat_id:
-                    self.switch_chat(chat_id)
-                else:
-                    self.update_chat_list()
-                del self.pending_messages[chat_id]
 
     def update_user_list(self):
         self.user_list.clear()
@@ -1071,26 +1513,6 @@ class MainWindow(QMainWindow):
             self.load_chat_from_file(chat_id, chat)
             self.chats[chat_id] = chat
         self.switch_chat(chat_id)
-
-    def send_message(self, chat_id: str, text: str):
-        if chat_id not in self.chats:
-            return
-        chat = self.chats[chat_id]
-
-        if chat.type == "private":
-            target = self.username if chat_id == "saved_messages" else chat.name
-            if chat.shared_key:
-                encrypted = Crypto.encrypt(chat.shared_key, text)
-                self.network.send_private(target, encrypted)
-                chat.add_message(self.username, text, True)
-
-                if chat_id != "saved_messages":
-                    self.save_chat_to_file(chat_id, chat)
-
-                if chat_id == "saved_messages":
-                    self.save_saved_messages()
-                if self.current_chat_id == chat_id:
-                    self.switch_chat(chat_id)
 
     def open_saved_messages(self):
         chat_id = "saved_messages"
@@ -1162,6 +1584,7 @@ class MainWindow(QMainWindow):
         w = ChatWidget(chat, self.current_theme)
         w.send_signal.connect(self.send_message)
         w.send_media_signal.connect(self.send_media)
+        w.call_signal.connect(self.start_call_to_user)
         self.chat_stack_layout.addWidget(w)
         self.setWindowTitle(f"Secure Chat - {chat.name}")
 
@@ -1213,10 +1636,116 @@ class MainWindow(QMainWindow):
         self.auto_delete_timer.stop()
         self.auto_save_all_chats()
         self.save_saved_messages()
+        if self.call_in_progress and self.call_manager:
+            self.network.end_call()
         if self.network:
             self.network.disconnect()
             self.network.wait(2000)
         event.accept()
+
+
+class CallManager:
+    """Управление WebRTC звонками с шифрованием"""
+
+    def __init__(self, crypto_key: bytes = None):
+        self.pc = None
+        self.local_stream = None
+        self.is_calling = False
+        self.crypto_key = crypto_key
+        self.ice_candidates = []
+        self.loop = None
+
+    async def start_call(self):
+        """Начать звонок - создать offer"""
+        if not AIORTC_AVAILABLE:
+            raise Exception("aiortc не установлен")
+
+        self.pc = RTCPeerConnection()
+        self.is_calling = True
+
+        @self.pc.on("icecandidate")
+        def on_ice_candidate(candidate):
+            if candidate:
+                candidate_data = {
+                    "candidate": candidate.candidate,
+                    "sdpMLineIndex": candidate.sdpMLineIndex,
+                    "sdpMid": candidate.sdpMid
+                }
+                self.ice_candidates.append(candidate_data)
+
+        # Добавляем аудио трек
+        try:
+            self.local_stream = MediaPlayer("/dev/zero", format="f32le", options={"fsize": 3200})
+            self.pc.addTrack(self.local_stream.audio)
+        except Exception as e:
+            print(f"⚠️ Не удалось добавить аудио: {e}")
+
+        offer = await self.pc.createOffer()
+        await self.pc.setLocalDescription(offer)
+
+        # Шифруем SDP
+        sdp = self.pc.localDescription.sdp
+        if self.crypto_key:
+            encrypted = Crypto.encrypt(self.crypto_key, sdp)
+            return json.dumps(encrypted)
+        return sdp
+
+    async def handle_answer(self, sdp_data: str):
+        """Обработать ответ от собеседника"""
+        try:
+            # Дешифруем SDP
+            if self.crypto_key:
+                data = json.loads(sdp_data)
+                if "nonce" in data:
+                    sdp = Crypto.decrypt(self.crypto_key, data["nonce"], data["ciphertext"])
+                else:
+                    sdp = sdp_data
+            else:
+                sdp = sdp_data
+
+            answer = RTCSessionDescription(sdp=sdp, type="answer")
+            await self.pc.setRemoteDescription(answer)
+            return True
+        except Exception as e:
+            print(f"Ошибка обработки ответа: {e}")
+            return False
+
+    async def add_ice_candidate(self, candidate_data: str):
+        """Добавить ICE кандидат"""
+        try:
+            # Дешифруем кандидат
+            if self.crypto_key:
+                data = json.loads(candidate_data)
+                if "nonce" in data:
+                    candidate_str = Crypto.decrypt(self.crypto_key, data["nonce"], data["ciphertext"])
+                else:
+                    candidate_str = candidate_data
+            else:
+                candidate_str = candidate_data
+
+            candidate_dict = json.loads(candidate_str)
+            candidate = RTCIceCandidate(
+                candidate=candidate_dict["candidate"],
+                sdpMLineIndex=candidate_dict["sdpMLineIndex"],
+                sdpMid=candidate_dict["sdpMid"]
+            )
+            await self.pc.addIceCandidate(candidate)
+            return True
+        except Exception as e:
+            print(f"Ошибка добавления ICE: {e}")
+            return False
+
+    async def end_call(self):
+        """Завершить звонок"""
+        self.is_calling = False
+        if self.pc:
+            await self.pc.close()
+            self.pc = None
+        self.ice_candidates = []
+
+    def get_ice_candidates(self):
+        """Получить накопленные ICE кандидаты"""
+        return self.ice_candidates
 
 
 class ClientApp(QApplication):
