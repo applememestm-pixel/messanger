@@ -6,6 +6,8 @@ Secure Chat Client - v5.1 (с выбором цвета фона)
 import sys
 import os
 import ssl
+import asyncio
+import threading
 import socket
 import struct
 import json
@@ -557,9 +559,7 @@ class ChatWidget(QWidget):
                 print(f"Ошибка открытия файла: {e}")
 
     def on_call_clicked(self):
-        """Клик по кнопке звонка"""
-        self.call_signal.emit()
-
+        self.call_signal.emit(self.chat.id)
     def on_send_media(self):
         """Отправка медиа-файла"""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -887,7 +887,7 @@ class MainWindow(QMainWindow):
                 print(f"Ошибка загрузки {filename}: {e}")
 
     # ==================== ЗВОНКИ ====================
-    async def start_call_to_user(self):
+    def start_call_to_user(self):
         if not self.current_chat_id or self.current_chat_id == "saved_messages":
             self.add_system_message("❌ Выберите пользователя")
             return
@@ -905,47 +905,39 @@ class MainWindow(QMainWindow):
         self.call_in_progress = True
 
         try:
+            # Запускаем async функцию в отдельном потоке
+            import threading
+            thread = threading.Thread(target=self._run_call, args=(chat.name,))
+            thread.daemon = True
+            thread.start()
+        except Exception as e:
+            self.add_system_message(f"❌ Ошибка: {e}")
+            self.call_in_progress = False
+
+    def _run_call(self, target_name: str):
+        """Вспомогательная функция для запуска async кода"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._async_start_call(target_name))
+        finally:
+            loop.close()
+
+    async def _async_start_call(self, target_name: str):
+        """Async версия звонка"""
+        try:
             sdp = await self.call_manager.start_call()
-            self.network.start_call(chat.name, sdp)  # Добавьте оба параметра
-            self.add_system_message(f"📞 Начинаем звонок {chat.name}...")
+            self.network.start_call(target_name, sdp)
+            self.add_system_message(f"📞 Начинаем звонок {target_name}...")
 
             # Отправляем ICE candidates
             while self.call_in_progress and self.call_manager.ice_candidates:
                 candidate = self.call_manager.ice_candidates.pop(0)
-                self.network.send_ice_candidate(chat.name, json.dumps(candidate))
+                self.network.send_ice_candidate(target_name, json.dumps(candidate))
                 await asyncio.sleep(0.1)
-        except Exception as e:
-            self.add_system_message(f"❌ Ошибка: {e}")
-            self.call_in_progress = False
-
-    def _run_async_call(self, target: str):
-        """Запуск асинхронного звонка в отдельном потоке"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        try:
-            loop.run_until_complete(self._async_start_call(target))
         except Exception as e:
             self.add_system_message(f"❌ Ошибка звонка: {e}")
             self.call_in_progress = False
-        finally:
-            loop.close()
-
-    async def _async_start_call(self, target: str):
-        """Асинхронный старт звонка"""
-        try:
-            sdp = await self.call_manager.start_call()
-            self.network.start_call(target, sdp)
-
-            # Отправляем ICE кандидаты
-            while self.call_in_progress:
-                candidates = self.call_manager.get_ice_candidates()
-                for candidate in candidates:
-                    encrypted_candidate = Crypto.encrypt(self.call_manager.crypto_key, json.dumps(candidate))
-                    self.network.send_ice_candidate(target, json.dumps(encrypted_candidate))
-                await asyncio.sleep(0.5)
-        except Exception as e:
-            self.add_system_message(f"❌ Ошибка: {e}")
 
     def on_call_incoming(self, caller: str, sdp: str):
         """Входящий звонок"""
@@ -1575,7 +1567,7 @@ class MainWindow(QMainWindow):
         w = ChatWidget(chat, self.current_theme)
         w.send_signal.connect(self.send_message)
         w.send_media_signal.connect(self.send_media)
-        w.call_signal.connect(self.start_call_to_user)
+        w.call_signal.connect(lambda: self.start_call_to_user())
         self.chat_stack_layout.addWidget(w)
         self.setWindowTitle(f"Secure Chat - {chat.name}")
 
