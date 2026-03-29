@@ -321,40 +321,31 @@ class NetworkClient(QThread):
             self._send_json({"type": "private", "target": target, "data": encrypted_data})
 
     # Методы для звонков
-    async def start_call(self):
-        self.pc = RTCPeerConnection()
-        self.is_calling = True
-
-        @self.pc.on("icecandidate")
-        def on_ice_candidate(candidate):
-            if candidate:
-                self.ice_candidates.append({
-                    "candidate": candidate.candidate,
-                    "sdpMLineIndex": str(candidate.sdpMLineIndex),  # Конвертируем в строку
-                    "sdpMid": candidate.sdpMid
-                })
-
-        # Убрали MediaPlayer - он вызывает ошибку
-        self.pc.addTrack(None)  # Просто добавляем пустой трек
-
-        offer = await self.pc.createOffer()
-        await self.pc.setLocalDescription(offer)
-
-        sdp = self.pc.localDescription.sdp
-        if self.crypto_key:
-            encrypted = Crypto.encrypt(self.crypto_key, sdp)
-            return json.dumps(encrypted)
-        return sdp._send_json({"type": "call_start", "target": target, "sdp": sdp})
+    def start_call(self, target: str, sdp: str):
+        if self.running and self.sock:
+            self._send_json({
+                "type": "call_start",
+                "target": target,
+                "sdp": sdp
+            })
 
     def accept_call(self, caller: str, sdp: str):
         if self.running and self.sock:
-            self._send_json({"type": "call_accept", "caller": caller, "sdp": sdp})
+            self._send_json({
+                "type": "call_accept",
+                "caller": caller,
+                "sdp": sdp
+            })
 
     def send_ice_candidate(self, target: str, candidate: str):
         if self.running and self.sock:
-            self._send_json({"type": "call_ice", "target": target, "candidate": candidate})
+            self._send_json({
+                "type": "call_ice",
+                "target": target,
+                "candidate": candidate
+            })
 
-    def end_call(self, target: str = None):
+    def end_call(self):
         if self.running and self.sock:
             self._send_json({"type": "call_end"})
 
@@ -896,12 +887,7 @@ class MainWindow(QMainWindow):
                 print(f"Ошибка загрузки {filename}: {e}")
 
     # ==================== ЗВОНКИ ====================
-    def start_call_to_user(self):
-        """Начать звонок выбранному пользователю"""
-        if not AIORTC_AVAILABLE:
-            self.add_system_message("❌ WebRTC не установлен. Установите: pip install aiortc aioice av")
-            return
-
+    async def start_call_to_user(self):
         if not self.current_chat_id or self.current_chat_id == "saved_messages":
             self.add_system_message("❌ Выберите пользователя")
             return
@@ -915,17 +901,22 @@ class MainWindow(QMainWindow):
             self.add_system_message("❌ Нет ключа шифрования")
             return
 
-        if self.call_in_progress:
-            self.add_system_message("❌ Звонок уже в процессе")
-            return
-
         self.call_manager = CallManager(crypto_key=chat.shared_key)
         self.call_in_progress = True
-        self.add_system_message(f"📞 Начинаем звонок {chat.name}...")
 
-        # Запускаем асинхронный звонок
-        self.call_thread = threading.Thread(target=self._run_async_call, args=(chat.name,), daemon=True)
-        self.call_thread.start()
+        try:
+            sdp = await self.call_manager.start_call()
+            self.network.start_call(chat.name, sdp)  # Добавьте оба параметра
+            self.add_system_message(f"📞 Начинаем звонок {chat.name}...")
+
+            # Отправляем ICE candidates
+            while self.call_in_progress and self.call_manager.ice_candidates:
+                candidate = self.call_manager.ice_candidates.pop(0)
+                self.network.send_ice_candidate(chat.name, json.dumps(candidate))
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            self.add_system_message(f"❌ Ошибка: {e}")
+            self.call_in_progress = False
 
     def _run_async_call(self, target: str):
         """Запуск асинхронного звонка в отдельном потоке"""
